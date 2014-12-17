@@ -362,6 +362,7 @@ func (suite *DriverSuite) TestContinueStreamAppend(c *check.C) {
 	filename := randomPath(32)
 	defer suite.StorageDriver.Delete(firstPart(filename))
 
+	// chunkSize := int64(32)
 	chunkSize := int64(10 * 1024 * 1024)
 
 	contentsChunk1 := randomContents(chunkSize)
@@ -642,6 +643,7 @@ func (suite *DriverSuite) TestStatCall(c *check.C) {
 	dirPath := randomPath(32)
 	fileName := randomFilename(32)
 	filePath := path.Join(dirPath, fileName)
+	defer suite.StorageDriver.Delete(dirPath)
 
 	defer suite.StorageDriver.Delete(firstPart(dirPath))
 

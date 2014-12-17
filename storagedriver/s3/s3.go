@@ -1,5 +1,3 @@
-// +build ignore
-
 package s3
 
 import (
@@ -8,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/crowdmob/goamz/aws"
 	"github.com/crowdmob/goamz/s3"
@@ -19,10 +19,10 @@ const driverName = "s3"
 
 // minChunkSize defines the minimum multipart upload chunk size
 // S3 API requires multipart upload chunks to be at least 5MB
-const minChunkSize = 5 * 1024 * 1024
+const chunkSize = 5 * 1024 * 1024
 
-// listPartsMax is the largest amount of parts you can request from S3
-const listPartsMax = 1000
+// listMax is the largest amount of objects you can request from S3 in a list call
+const listMax = 1000
 
 func init() {
 	factory.Register(driverName, &s3DriverFactory{})
@@ -101,6 +101,21 @@ func New(accessKey string, secretKey string, region aws.Region, encrypt bool, bu
 		}
 	}
 
+	// TODO What if they use this bucket for other things? I can't just clean out the multis
+	// TODO Add timestamp checking
+	multis, _, err := bucket.ListMulti("", "")
+	if err != nil {
+		return nil, err
+	}
+
+	for _, multi := range multis {
+		err := multi.Abort()
+		//TODO appropriate to do this error checking?
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &Driver{s3obj, bucket, encrypt}, nil
 }
 
@@ -108,108 +123,215 @@ func New(accessKey string, secretKey string, region aws.Region, encrypt bool, bu
 
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *Driver) GetContent(path string) ([]byte, error) {
+	path = strings.TrimLeft(path, "/")
 	content, err := d.Bucket.Get(path)
 	if err != nil {
-		return nil, storagedriver.PathNotFoundError{Path: path}
+		if s3Err, ok := err.(*s3.Error); ok && s3Err.Code == "NoSuchKey" {
+			return nil, storagedriver.PathNotFoundError{Path: "/" + path}
+		} else {
+			return nil, err
+		}
 	}
 	return content, nil
 }
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *Driver) PutContent(path string, contents []byte) error {
+	path = strings.TrimLeft(path, "/")
 	return d.Bucket.Put(path, contents, d.getContentType(), getPermissions(), d.getOptions())
+}
+
+type EmptyReadCloser struct{}
+
+func (rc EmptyReadCloser) Close() error {
+	return nil
+}
+
+func (rc EmptyReadCloser) Read(p []byte) (n int, err error) {
+	return bytes.NewReader([]byte{}).Read(p)
 }
 
 // ReadStream retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *Driver) ReadStream(path string, offset int64) (io.ReadCloser, error) {
+	path = strings.TrimLeft(path, "/")
+	if offset < 0 {
+		return nil, storagedriver.InvalidOffsetError{Path: "/" + path, Offset: offset}
+	}
+
 	headers := make(http.Header)
 	headers.Add("Range", "bytes="+strconv.FormatInt(offset, 10)+"-")
 
 	resp, err := d.Bucket.GetResponseWithHeaders(path, headers)
 	if err != nil {
-		return nil, storagedriver.PathNotFoundError{Path: path}
+		if s3Err, ok := err.(*s3.Error); ok && s3Err.Code == "NoSuchKey" {
+			return nil, storagedriver.PathNotFoundError{Path: "/" + path}
+		} else if s3Err, ok := err.(*s3.Error); ok && s3Err.Code == "InvalidRange" {
+
+			return EmptyReadCloser{}, nil
+		} else {
+			return nil, err
+		}
 	}
 	return resp.Body, nil
 }
 
 // WriteStream stores the contents of the provided io.ReadCloser at a location
 // designated by the given path.
-func (d *Driver) WriteStream(path string, offset, size int64, reader io.ReadCloser) error {
-	defer reader.Close()
-
-	chunkSize := int64(minChunkSize)
-	for size/chunkSize >= listPartsMax {
-		chunkSize *= 2
+func (d *Driver) WriteStream(path string, offset int64, reader io.Reader) (totalRead int64, err error) {
+	path = strings.TrimLeft(path, "/")
+	if offset < 0 {
+		return 0, storagedriver.InvalidOffsetError{Path: "/" + path, Offset: offset}
 	}
 
 	partNumber := 1
-	var totalRead int64
-	multi, parts, err := d.getAllParts(path)
+	parts := []s3.Part{}
+	var part s3.Part
+
+	multi, err := d.Bucket.InitMulti(path, d.getContentType(), getPermissions(), d.getOptions())
 	if err != nil {
-		return err
-	}
-
-	if (offset) > int64(len(parts))*chunkSize || (offset < size && offset%chunkSize != 0) {
-		return storagedriver.InvalidOffsetError{Path: path, Offset: offset}
-	}
-
-	if len(parts) > 0 {
-		partNumber = int(offset/chunkSize) + 1
-		totalRead = offset
-		parts = parts[0 : partNumber-1]
+		return 0, err
 	}
 
 	buf := make([]byte, chunkSize)
+
+	// We never want to leave a dangling multipart upload, our only consistent state is
+	// when there is a whole object at path. This is in order to remain consistent with
+	// the stat call.
+	//
+	// Note that if the machine dies before executing the defer, we will be left with a dangling
+	// multipart upload, which will eventually be cleaned up, but we will lose all of the progress
+	// made prior to the machine crashing.
+	defer func() {
+		if len(parts) > 0 {
+			err = multi.Complete(parts)
+			if err != nil {
+				multi.Abort()
+			}
+		}
+	}()
+
+	if offset > 0 {
+		resp, err := d.Bucket.Head(path, nil)
+		if err != nil {
+			return 0, err
+		}
+		if resp.ContentLength < offset {
+			return 0, storagedriver.InvalidOffsetError{Path: "/" + path, Offset: offset}
+		}
+
+		if resp.ContentLength < chunkSize {
+			// If everything written so far is less than the minimum part size of 5MB, we need
+			// to fill out the first part up to that minimum.
+			current, err := d.ReadStream(path, 0)
+			if err != nil {
+				return 0, err
+			}
+
+			bytesRead, err := io.ReadFull(current, buf[0:offset])
+			if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+				return 0, err
+			} else if int64(bytesRead) != offset {
+				//TODO Maybe a different error? I don't even think this case is reachable...
+				return 0, storagedriver.InvalidOffsetError{Path: "/" + path, Offset: offset}
+			}
+
+			bytesRead, err = io.ReadFull(reader, buf[offset:])
+			totalRead += int64(bytesRead)
+
+			if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+				return totalRead, err
+			} else {
+				part, err = multi.PutPart(int(partNumber), bytes.NewReader(buf[0:int64(bytesRead)+offset]))
+				if err != nil {
+					return totalRead, err
+				}
+
+			}
+
+		} else {
+			// If the file that we already have is larger than 5MB, then we make it the first part
+			// of the new multipart upload.
+			_, part, err = multi.PutPartCopy(partNumber, s3.CopyOptions{}, d.Bucket.Name+"/"+path)
+			if err != nil {
+				return 0, err
+			}
+		}
+
+		parts = append(parts, part)
+		partNumber++
+
+		if totalRead+offset < chunkSize {
+			return totalRead, nil
+		}
+	}
+
 	for {
 		bytesRead, err := io.ReadFull(reader, buf)
 		totalRead += int64(bytesRead)
 
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-			return err
-		} else if (int64(bytesRead) < chunkSize) && totalRead != size {
-			break
+			return totalRead, err
 		} else {
 			part, err := multi.PutPart(int(partNumber), bytes.NewReader(buf[0:bytesRead]))
 			if err != nil {
-				return err
+				return totalRead, err
 			}
 
 			parts = append(parts, part)
-			if totalRead == size {
-				multi.Complete(parts)
+			partNumber++
+
+			if int64(bytesRead) < chunkSize {
 				break
 			}
-
-			partNumber++
 		}
 	}
 
-	return nil
+	return totalRead, nil
 }
 
-// CurrentSize retrieves the curernt size in bytes of the object at the given
-// path.
-func (d *Driver) CurrentSize(path string) (uint64, error) {
-	_, parts, err := d.getAllParts(path)
+// Stat retrieves the FileInfo for the given path, including the current size
+// in bytes and the creation time.
+func (d *Driver) Stat(path string) (storagedriver.FileInfo, error) {
+	path = strings.TrimLeft(path, "/")
+	listResponse, err := d.Bucket.List(path, "", "", 1)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	if len(parts) == 0 {
-		return 0, nil
+	fi := storagedriver.FileInfoFields{
+		Path: path,
 	}
 
-	return (((uint64(len(parts)) - 1) * uint64(parts[0].Size)) + uint64(parts[len(parts)-1].Size)), nil
+	if len(listResponse.Contents) == 1 {
+		if listResponse.Contents[0].Key != path {
+			fi.IsDir = true
+		} else {
+			fi.IsDir = false
+			fi.Size = listResponse.Contents[0].Size
+
+			timestamp, err := time.Parse(time.RFC3339Nano, listResponse.Contents[0].LastModified)
+			if err != nil {
+				return nil, err
+			}
+			fi.ModTime = timestamp
+		}
+	} else if len(listResponse.CommonPrefixes) == 1 {
+		fi.IsDir = true
+	} else {
+		return nil, storagedriver.PathNotFoundError{Path: "/" + path}
+	}
+
+	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
 }
 
-// List returns a list of the objects that are direct descendants of the given
-// path.
+// List returns a list of the objects that are direct descendants of the given path.
 func (d *Driver) List(path string) ([]string, error) {
-	if path[len(path)-1] != '/' {
+	path = strings.TrimLeft(path, "/")
+	if path != "" && path[len(path)-1] != '/' {
 		path = path + "/"
 	}
-	listResponse, err := d.Bucket.List(path, "/", "", listPartsMax)
+	listResponse, err := d.Bucket.List(path, "/", "", listMax)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +349,7 @@ func (d *Driver) List(path string) ([]string, error) {
 		}
 
 		if listResponse.IsTruncated {
-			listResponse, err = d.Bucket.List(path, "/", listResponse.NextMarker, listPartsMax)
+			listResponse, err = d.Bucket.List(path, "/", listResponse.NextMarker, listMax)
 			if err != nil {
 				return nil, err
 			}
@@ -242,12 +364,15 @@ func (d *Driver) List(path string) ([]string, error) {
 // Move moves an object stored at sourcePath to destPath, removing the original
 // object.
 func (d *Driver) Move(sourcePath string, destPath string) error {
+	sourcePath = strings.TrimLeft(sourcePath, "/")
+	destPath = strings.TrimLeft(destPath, "/")
+
 	/* This is terrible, but aws doesn't have an actual move. */
 	_, err := d.Bucket.PutCopy(destPath, getPermissions(),
 		s3.CopyOptions{Options: d.getOptions(), MetadataDirective: "", ContentType: d.getContentType()},
 		d.Bucket.Name+"/"+sourcePath)
 	if err != nil {
-		return storagedriver.PathNotFoundError{Path: sourcePath}
+		return storagedriver.PathNotFoundError{Path: "/" + sourcePath}
 	}
 
 	return d.Delete(sourcePath)
@@ -255,12 +380,13 @@ func (d *Driver) Move(sourcePath string, destPath string) error {
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *Driver) Delete(path string) error {
-	listResponse, err := d.Bucket.List(path, "", "", listPartsMax)
+	path = strings.TrimLeft(path, "/")
+	listResponse, err := d.Bucket.List(path, "", "", listMax)
 	if err != nil || len(listResponse.Contents) == 0 {
-		return storagedriver.PathNotFoundError{Path: path}
+		return storagedriver.PathNotFoundError{Path: "/" + path}
 	}
 
-	s3Objects := make([]s3.Object, listPartsMax)
+	s3Objects := make([]s3.Object, listMax)
 
 	for len(listResponse.Contents) > 0 {
 		for index, key := range listResponse.Contents {
@@ -272,7 +398,7 @@ func (d *Driver) Delete(path string) error {
 			return nil
 		}
 
-		listResponse, err = d.Bucket.List(path, "", "", listPartsMax)
+		listResponse, err = d.Bucket.List(path, "", "", listMax)
 		if err != nil {
 			return err
 		}
@@ -281,36 +407,36 @@ func (d *Driver) Delete(path string) error {
 	return nil
 }
 
-func (d *Driver) getHighestIDMulti(path string) (multi *s3.Multi, err error) {
-	multis, _, err := d.Bucket.ListMulti(path, "")
-	if err != nil && !hasCode(err, "NoSuchUpload") {
-		return nil, err
-	}
+// func (d *Driver) getHighestIDMulti(path string) (multi *s3.Multi, err error) {
+// 	multis, _, err := d.Bucket.ListMulti(path, "")
+// 	if err != nil && !hasCode(err, "NoSuchUpload") {
+// 		return nil, err
+// 	}
 
-	uploadID := ""
+// 	uploadID := ""
 
-	if len(multis) > 0 {
-		for _, m := range multis {
-			if m.Key == path && m.UploadId >= uploadID {
-				uploadID = m.UploadId
-				multi = m
-			}
-		}
-		return multi, nil
-	}
-	multi, err = d.Bucket.InitMulti(path, d.getContentType(), getPermissions(), d.getOptions())
-	return multi, err
-}
+// 	if len(multis) > 0 {
+// 		for _, m := range multis {
+// 			if m.Key == path && m.UploadId >= uploadID {
+// 				uploadID = m.UploadId
+// 				multi = m
+// 			}
+// 		}
+// 		return multi, nil
+// 	}
+// 	multi, err = d.Bucket.InitMulti(path, d.getContentType(), getPermissions(), d.getOptions())
+// 	return multi, err
+// }
 
-func (d *Driver) getAllParts(path string) (*s3.Multi, []s3.Part, error) {
-	multi, err := d.getHighestIDMulti(path)
-	if err != nil {
-		return nil, nil, err
-	}
+// func (d *Driver) getAllParts(path string) (*s3.Multi, []s3.Part, error) {
+// 	multi, err := d.getHighestIDMulti(path)
+// 	if err != nil {
+// 		return nil, nil, err
+// 	}
 
-	parts, err := multi.ListParts()
-	return multi, parts, err
-}
+// 	parts, err := multi.ListParts()
+// 	return multi, parts, err
+// }
 
 func hasCode(err error, code string) bool {
 	s3err, ok := err.(*aws.Error)

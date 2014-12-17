@@ -1,5 +1,3 @@
-// +build ignore
-
 package s3
 
 import (
@@ -22,6 +20,7 @@ func init() {
 	secretKey := os.Getenv("AWS_SECRET_KEY")
 	bucket := os.Getenv("S3_BUCKET")
 	encrypt := os.Getenv("S3_ENCRYPT")
+	region := os.Getenv("AWS_REGION")
 
 	s3DriverConstructor := func(region aws.Region) (storagedriver.StorageDriver, error) {
 		shouldEncrypt, err := strconv.ParseBool(encrypt)
@@ -39,18 +38,20 @@ func init() {
 		return ""
 	}
 
-	for _, region := range aws.Regions {
-		if region == aws.USGovWest {
-			continue
-		}
+	// for _, region := range aws.Regions {
+	// 	if region == aws.USGovWest {
+	// 		continue
+	// 	}
 
-		testsuites.RegisterInProcessSuite(s3DriverConstructor(region), skipCheck)
-		testsuites.RegisterIPCSuite(driverName, map[string]string{
-			"accesskey": accessKey,
-			"secretkey": secretKey,
-			"region":    region.Name,
-			"bucket":    bucket,
-			"encrypt":   encrypt,
-		}, skipCheck)
-	}
+	testsuites.RegisterInProcessSuite(func() (storagedriver.StorageDriver, error) {
+		return s3DriverConstructor(aws.GetRegion(region))
+	}, skipCheck)
+	// testsuites.RegisterIPCSuite(driverName, map[string]string{
+	// 	"accesskey": accessKey,
+	// 	"secretkey": secretKey,
+	// 	"region":    region.Name,
+	// 	"bucket":    bucket,
+	// 	"encrypt":   encrypt,
+	// }, skipCheck)
+	// }
 }
